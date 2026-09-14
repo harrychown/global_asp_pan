@@ -1,0 +1,30 @@
+
+DIR="/rds/general/user/hchown/home/global/pangenome-analysis"
+NEWICKTREE=$( echo "$DIR/shared_tree.nwk")
+TRAITS=$( echo "$DIR/scoary-traits.csv")
+PG_MATRIX=$( echo "$DIR/shared_pangenome.csv")
+TRAITS_CLEAN=$( echo "$DIR/shared_traits.csv")
+ITR_TRAITS=$( echo "$DIR/ITR_traits.csv")
+SRC_TRAITS=$( echo "$DIR/source_traits.csv")
+
+module load anaconda3/personal
+
+#mkdir $DIR/scoary
+# Filter traits file - if needed
+#head -n1 $PG_MATRIX | sed 's/,/\n/g' | sed '1d' | sed 's/$/,/g' > tmp
+#grep -f tmp $TRAITS > tmp.2
+#head -n1 $TRAITS > $TRAITS_CLEAN
+#cat tmp.2 >> $TRAITS_CLEAN
+
+# Run scoary
+source activate scoary
+rm -rf $DIR/scoaryITR $DIR/scoarySRC
+mkdir $DIR/scoaryITR
+scoary -s 2 -n $NEWICKTREE -t $ITR_TRAITS -g $PG_MATRIX -o $DIR/scoaryITR -p 1E-5 -c B 
+mkdir $DIR/scoarySRC
+scoary -s 2 -n $NEWICKTREE -t $SRC_TRAITS -g $PG_MATRIX -o $DIR/scoarySRC -p 1E-5 -c BH --no_pairwise
+ 
+
+scoary -s 2 -n $NEWICKTREE -t  $DIR/scoaryCLUST/clust_traits.shared.csv -g $PG_MATRIX -o  $DIR/scoaryCLUST -p 1E-5 -c B 
+
+scoary -s 2 -n $NEWICKTREE -t  $DIR/scoaryGENO/geno_traits.shared.csv -g $PG_MATRIX -o  $DIR/scoaryGENO -p 1E-5 -c B 

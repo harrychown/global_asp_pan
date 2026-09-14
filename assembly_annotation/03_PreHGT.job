@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=15:mem=100gb
+#PBS -N zhgt
+
+#STRAIN=$(sed -n "${PBS_ARRAY_INDEX}p" /rds/general/user/hchown/home/global/pangenome-analysis/shared_strains_list.txt)
+
+module load anaconda3/personal
+NSLOTS=15
+STRAIN=C100
+OUTDIR="/rds/general/user/hchown/home/global/data/hgt"
+PREHGT="/rds/general/user/hchown/home/prehgt"
+
+
+# Extract candidates
+grep "${STRAIN}"_  /rds/general/user/hchown/home/global/hgt-analysis/non_afum.shared_total.txt > candidates.txt
+# Load seqtk
+source activate seqtk
+seqtk subseq /rds/general/user/hchown/home/orthofinder/$STRAIN.braker.filtered.faa candidates.txt > $STRAIN.HGT-candidate.faa
+# Run PreHGT
+
+mkdir -p $OUTDIR/$STRAIN
+# Perform a BLAST search against the candidate genes
+source activate diamond
+diamond blastp --db $PREHGT/nr_rep_seq.fasta.gz --query $STRAIN.HGT-candidate.faa --out $STRAIN.nr.tsv  --tmpdir $TMPDIR --outfmt 6 qseqid qtitle sseqid stitle pident approx_pident length mismatch gapopen qstart qend qlen qcovhsp sstart send slen scovhsp evalue bitscore score corrected_bitscore --max-target-seqs 100 --threads $NSLOTS --faster
+
+module purge
+module add tools/prod
+module add R/4.2.1-foss-2022a
+
+Rscript $PREHGT/blastp_add_taxonomy_info.R $PREHGT/nr_cluster_taxid_formatted_final.sqlite $STRAIN.nr.tsv $STRAIN.nr_lineages.tsv
+
+#conda activate hgt
+Rscript $PREHGT/blastp_to_hgt_candidates_kingdom.R  $STRAIN.nr_lineages.tsv $STRAIN.blastp_kingdom_scores.tsv $STRAIN.blastp_kingdom_gene_lst.txt Fungi
+
+Rscript $PREHGT/blastp_to_hgt_candidates_subkingdom.R $STRAIN.nr_lineages.tsv 1 $STRAIN.blastp_subkingdom_scores.tsv $STRAIN.blastp_subkingdom_gene_lst.txt
+
+Rscript $PREHGT/set_qlineage.R $STRAIN.nr_lineages.tsv 1 $STRAIN.blastp_subkingdom_scores.tsv $STRAIN.blastp_subkingdom_gene_lst.txt
+
+mv *.txt *.tsv *.faa $OUTDIR/$STRAIN
+
+
+

@@ -1,0 +1,159 @@
+#!/bin/bash --login
+#$ -cwd
+#$ -t 1-1102
+##$ -pe smp.pe 4
+#$ -N zcollapse
+
+module load apps/binapps/anaconda3/2021.11
+module load tools/env/proxy2 
+module load apps/bioinf
+module load apps/binapps/gatk/4.1.8.0
+module load apps/samtools/1.4/gcc-4.8.5
+module load apps/gcc/R/4.1.2 
+module load apps/binapps/bowtie2/2.4.1
+ulimit -S -n 4096 -v unlimited
+export OMP_NUM_THREADS=$NSLOTS
+
+PREFIX=`awk "NR==$SGE_TASK_ID" filtered-strains.txt`
+
+RAGTAG="./ragtag/$PREFIX.ragtag.fasta"
+READ1TAR="./trimmed_reads/${PREFIX}_1.clean.fastq.tar.gz"
+READ2TAR="./trimmed_reads/${PREFIX}_2.clean.fastq.tar.gz"
+READ1=$( echo "$READ1TAR" | cut -d'/' -f3 | sed "s/.tar.gz//" )
+READ2=$( echo "$READ2TAR" | cut -d'/' -f3 | sed "s/.tar.gz//" )
+
+BRAKERDIR="/mnt/iusers01/pb01/f99731hc/scratch/global_re_run/braker-clean"
+EXONERATEDIR="/mnt/iusers01/pb01/f99731hc/scratch/global_re_run/exonerate"
+COVDIR="/mnt/iusers01/pb01/f99731hc/scratch/global_re_run/coverage"
+INITHGT="/mnt/iusers01/pb01/f99731hc/scratch/global_re_run/init-hgt"
+SIZE="/mnt/iusers01/pb01/f99731hc/scratch/global_re_run/size-list"
+
+# Extract reads
+tar -xvzf $READ1TAR --strip-components=3
+tar -xvzf $READ2TAR --strip-components=3
+
+# Map reads to contigs (bowtie2 v2.4.1, samtools v4.8.5)
+gunzip $RAGTAG.gz
+mkdir -p selfmap
+bowtie2-build $RAGTAG $PREFIX 
+bowtie2 -p $NSLOTS --sensitive -x $PREFIX -1 $READ1 -2 $READ2 -S $PREFIX.tmp.sam
+samtools view -q10 -bS $PREFIX.tmp.sam | samtools sort -o $PREFIX.ragtag.bam
+samtools view -q10 -bS $PREFIX.tmp.sam | samtools sort -n -o $PREFIX.ragtag.sortedN.bam
+
+# Index alignments and genome
+samtools index -bc $PREFIX.ragtag.bam
+samtools index $PREFIX.ragtag.bam
+samtools faidx $RAGTAG
+gzip $RAGTAG
+
+# Prepare GTF
+gunzip $BRAKERDIR/gtf/$PREFIX.braker.gtf.gz
+grep -P '\ttranscript\t' $BRAKERDIR/gtf/$PREFIX.braker.gtf | sort -k1,1 -k4,4n  > $BRAKERDIR/transcript/$PREFIX.braker-transcript.gtf
+echo "$PREFIX" transcript length:
+wc -l $BRAKERDIR/transcript/$PREFIX.braker-transcript.gtf
+cat $EXONERATEDIR/locus-gff/$PREFIX.AF293.exonerate.locus.gff $BRAKERDIR/transcript/$PREFIX.braker-transcript.gtf | sed 's/gene_id.*Afu/Afu/g' | sed 's/ ; gene_orientation [+|"."]//g' > $BRAKERDIR/total-gtf/$PREFIX.total.gtf
+echo "$PREFIX" total length:
+wc -l $BRAKERDIR/total-gtf/$PREFIX.total.gtf
+gzip $BRAKERDIR/gtf/$PREFIX.braker.gtf
+
+# Calculate coverage per gene
+conda activate bedtools_env
+bedtools coverage -a $BRAKERDIR/total-gtf/$PREFIX.total.gtf -b $PREFIX.ragtag.sortedN.bam  -g $RAGTAG.fai -bed | awk -F'\t' 'BEGIN {OFS = FS} { print $9, $10 * 150 / $12 }' | sort -k2,2n  > $COVDIR/$PREFIX.coverage.txt
+
+#### TIDY AND MERGE EXONERATE + BRAKER ###
+# This will generate a 1:1 transcript:gene file, without exonerate overlaps
+# Collapse GTFs
+conda activate bedtools_env
+gunzip $BRAKERDIR/gtf/$PREFIX.braker.gtf.gz
+python ~/scratch/global_re_run/collapse-braker.py $BRAKERDIR/gtf/$PREFIX.braker.gtf $EXONERATEDIR/locus-gff/$PREFIX.AF293.exonerate.locus.gff $BRAKERDIR/collapsed/$PREFIX.braker-collapsed.gtf $BRAKERDIR/clean/$PREFIX.braker-clean.gtf
+# Generate a list of transcripts and genes to drop
+grep -P '\ttranscript\t' $BRAKERDIR/gtf/$PREFIX.braker.gtf | awk '{ print $9 }' > $BRAKERDIR/clean/$PREFIX.inOG
+awk '{ print $9}' $BRAKERDIR/clean/$PREFIX.braker-clean.gtf > $BRAKERDIR/clean/$PREFIX.inNEW
+# Transcripts to drop
+cat $BRAKERDIR/clean/$PREFIX.inNEW $BRAKERDIR/clean/$PREFIX.inOG | sort | uniq -c | grep " 1 " | awk '{ print $2 }' > $BRAKERDIR/clean/$PREFIX.transcript2drop
+# Genes to drop
+#  $BRAKERDIR/clean/$PREFIX
+cut -d'.' -f1 $BRAKERDIR/clean/$PREFIX.transcript2drop > $BRAKERDIR/clean/$PREFIX.poss-gene2drop 
+cut -d'.' -f1 $BRAKERDIR/clean/$PREFIX.inNEW > $BRAKERDIR/clean/$PREFIX.gene2keep
+grep -Fwvf $BRAKERDIR/clean/$PREFIX.gene2keep $BRAKERDIR/clean/$PREFIX.poss-gene2drop > $BRAKERDIR/clean/$PREFIX.gene2drop 
+# Drop the resepect genes/transcripts
+grep -Fwvf $BRAKERDIR/clean/$PREFIX.gene2drop $BRAKERDIR/gtf/$PREFIX.braker.gtf | grep -Fwvf $BRAKERDIR/clean/$PREFIX.transcript2drop > $BRAKERDIR/clean/$PREFIX.braker-clean.gtf
+rm $BRAKERDIR/clean/$PREFIX.*2drop 
+
+#### FILTER MERGED BASED ON COVERAGE, SPECIES ID AND CONTIG SIZE
+# Check for coverage outliers
+grep -Fwf  $BRAKERDIR/clean/$PREFIX.inNEW $COVDIR/$PREFIX.coverage.txt > $COVDIR/$PREFIX.coverage-clean.txt # Retain only new IDs
+grep "Afu" $COVDIR/$PREFIX.coverage.txt >> $COVDIR/$PREFIX.coverage-clean.txt # Retain reference genes
+Rscript ~/scratch/global_re_run/identify-coverage-outliers.R $COVDIR/$PREFIX.coverage-clean.txt $COVDIR/$PREFIX.outliers.txt # Identify outliers
+# Retain outlier A. fumigatus
+grep -Fwf $BRAKERDIR/clean/$PREFIX.inNEW $INITHGT/$PREFIX.nr_lineages.tsv | grep "Aspergillus fumigatus" | cut -f1 > $INITHGT/$PREFIX.afum.txt # Identify genes linked to Afum
+grep -Fwvf $INITHGT/$PREFIX.afum.txt $COVDIR/$PREFIX.outliers.txt > $COVDIR/$PREFIX.NAfumOut.txt # Drop outliers if they contain Afum signal
+cut -d'.' -f1  $COVDIR/$PREFIX.NAfumOut.txt >  $COVDIR/$PREFIX.NAfumOut.gene.txt # Generate a gene ID list
+
+
+# DROP GENES FROM GTF
+gunzip $EXONERATEDIR/raw-gtf/$PREFIX.AF293.exonerate.gtf.gz 
+cat $EXONERATEDIR/raw-gtf/$PREFIX.AF293.exonerate.gtf > $BRAKERDIR/total-filtered/$PREFIX.filtered.gtf
+# Filter based on species identity, coverage and contig length
+grep -Fwvf $COVDIR/$PREFIX.NAfumOut.gene.txt $BRAKERDIR/clean/$PREFIX.braker-clean.gtf | grep -Fwf $SIZE/$PREFIX.size-exclusion.txt >> $BRAKERDIR/total-filtered/$PREFIX.filtered.gtf
+# Extract gene ID
+grep -P '\ttranscript\t' $BRAKERDIR/total-filtered/$PREFIX.filtered.gtf | grep -v "Afu" | awk '{ print $9 }' > $BRAKERDIR/total-filtered/$PREFIX.denovo.filtered.txt
+
+# DROP SEQUENCE DATA
+conda activate seqkit_env
+gunzip $EXONERATEDIR/nucleotide/$PREFIX.AF293.fna.gz
+gunzip $BRAKERDIR/nucleotide/$PREFIX.braker.codingseq.gz
+seqtk subseq $BRAKERDIR/nucleotide/$PREFIX.braker.codingseq $BRAKERDIR/total-filtered/$PREFIX.denovo.filtered.txt > $BRAKERDIR/nucleotide-filtered/$PREFIX.braker.filtered.fna
+cat $EXONERATEDIR/nucleotide/$PREFIX.AF293.fna $BRAKERDIR/nucleotide-filtered/$PREFIX.braker.filtered.fna > $BRAKERDIR/nucleotide-filtered/$PREFIX.total.filtered.fna
+
+
+gunzip $EXONERATEDIR/amino_acid/$PREFIX.AF293.faa.gz
+gunzip $BRAKERDIR/amino-acid/$PREFIX.braker.aa.gz
+seqtk subseq $BRAKERDIR/amino-acid/$PREFIX.braker.aa $BRAKERDIR/total-filtered/$PREFIX.denovo.filtered.txt > $BRAKERDIR/amino-acid-filtered/$PREFIX.braker.filtered.faa
+cat $EXONERATEDIR/amino_acid/$PREFIX.AF293.faa $BRAKERDIR/amino-acid-filtered/$PREFIX.braker.filtered.faa > $BRAKERDIR/amino-acid-filtered/$PREFIX.total.filtered.faa
+
+
+# SEPARATE MITOCHONDRIAL AND NUCLEAR SIGNALS
+grep -Pv 'Afu[0-9]' $BRAKERDIR/total-filtered/$PREFIX.filtered.gtf | grep 'AfuMt' | cut -f1 | sort | uniq >  $BRAKERDIR/total-filtered/$PREFIX.mito-contigs.txt
+grep -Fwf $BRAKERDIR/total-filtered/$PREFIX.mito-contigs.txt $BRAKERDIR/total-filtered/$PREFIX.filtered.gtf | grep -P '\ttranscript\t' | grep -v "Afu" | awk '{ print $9 }' > $BRAKERDIR/total-filtered/$PREFIX.mito.txt
+grep -Fwf $BRAKERDIR/total-filtered/$PREFIX.mito-contigs.txt $BRAKERDIR/total-filtered/$PREFIX.filtered.gtf | grep -P '\tgene\t' | grep "Afu" | sed 's/.*sequence Afu/Afu/' | awk '{ print $1 }' >> $BRAKERDIR/total-filtered/$PREFIX.mito.txt
+seqtk subseq $BRAKERDIR/nucleotide-filtered/$PREFIX.total.filtered.fna $BRAKERDIR/total-filtered/$PREFIX.mito.txt > $BRAKERDIR/nucleotide-mito/$PREFIX.mito.fna
+seqtk subseq $BRAKERDIR/amino-acid-filtered/$PREFIX.total.filtered.faa $BRAKERDIR/total-filtered/$PREFIX.mito.txt > $BRAKERDIR/amino-acid-mito/$PREFIX.mito.faa
+
+grep -Fwvf $BRAKERDIR/total-filtered/$PREFIX.mito-contigs.txt  $BRAKERDIR/total-filtered/$PREFIX.filtered.gtf | grep -P '\ttranscript\t' | grep -v "Afu" | awk '{ print $9 }' > $BRAKERDIR/total-filtered/$PREFIX.nucl.txt
+grep -Fwvf $BRAKERDIR/total-filtered/$PREFIX.mito-contigs.txt $BRAKERDIR/total-filtered/$PREFIX.filtered.gtf | grep -P '\tgene\t' | grep "Afu" | sed 's/.*sequence Afu/Afu/' | awk '{ print $1 }' >> $BRAKERDIR/total-filtered/$PREFIX.nucl.txt
+seqtk subseq $BRAKERDIR/nucleotide-filtered/$PREFIX.total.filtered.fna $BRAKERDIR/total-filtered/$PREFIX.nucl.txt > $BRAKERDIR/nucleotide-nuclear/$PREFIX.nucl.fna
+seqtk subseq $BRAKERDIR/amino-acid-filtered/$PREFIX.total.filtered.faa $BRAKERDIR/total-filtered/$PREFIX.nucl.txt > $BRAKERDIR/amino-acid-nuclear/$PREFIX.nucl.faa
+
+# GENERATE STATS
+TOTAL_COUNT=$( grep -c ">" $BRAKERDIR/amino-acid-filtered/$PREFIX.total.filtered.faa)
+EXONERATE_COUNT=$( grep -c ">" $EXONERATEDIR/amino_acid/$PREFIX.AF293.faa  )
+DENOVO_COUNT=$( grep -c ">" $BRAKERDIR/amino-acid-filtered/$PREFIX.braker.filtered.faa )
+NUCL_COUNT=$( grep -c ">" $BRAKERDIR/amino-acid-nuclear/$PREFIX.nucl.faa )
+MITO_COUNT=$( grep -c ">" $BRAKERDIR/amino-acid-mito/$PREFIX.mito.faa )
+echo "$PREFIX","$TOTAL_COUNT","$EXONERATE_COUNT","$DENOVO_COUNT","$NUCL_COUNT","$MITO_COUNT" > /mnt/iusers01/pb01/f99731hc/scratch/global_re_run/count-stat/$PREFIX.gene-count.csv
+
+
+# TIDY-UP 
+gzip -f $EXONERATEDIR/amino_acid/$PREFIX.AF293.faa
+gzip -f $BRAKERDIR/amino-acid/$PREFIX.braker.aa
+
+gzip -f $EXONERATEDIR/nucleotide/$PREFIX.AF293.fna
+gzip -f $BRAKERDIR/nucleotide/$PREFIX.braker.codingseq
+
+gzip -f $EXONERATEDIR/raw-gtf/$PREFIX.AF293.exonerate.gtf
+
+gzip -f $BRAKERDIR/gtf/$PREFIX.braker.gtf
+
+gzip -f  $BRAKERDIR/nucleotide-mito/$PREFIX.mito.fna
+gzip -f $BRAKERDIR/amino-acid-mito/$PREFIX.mito.faa
+
+
+gzip -f $BRAKERDIR/nucleotide-nuclear/$PREFIX.nucl.fna
+gzip -f $BRAKERDIR/amino-acid-nuclear/$PREFIX.nucl.faa
+
+gzip -f $BRAKERDIR/nucleotide-filtered/$PREFIX.total.filtered.fna
+gzip -f $BRAKERDIR/nucleotide-filtered/$PREFIX.braker.filtered.fna
+
+gzip -f $BRAKERDIR/amino-acid-filtered/$PREFIX.total.filtered.faa
+gzip -f $BRAKERDIR/amino-acid-filtered/$PREFIX.braker.filtered.faa

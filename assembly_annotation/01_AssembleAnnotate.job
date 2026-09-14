@@ -1,0 +1,184 @@
+#!/bin/bash --login
+#$ -cwd
+#$ -t 1-1234
+#$ -pe smp.pe 4
+#$ -N zglobal
+
+module load apps/binapps/anaconda3/2021.11
+module load tools/env/proxy2 
+module load apps/bioinf
+module load apps/binapps/gatk/4.1.8.0
+module load apps/samtools/1.4/gcc-4.8.5
+module load apps/gcc/R/4.1.2 
+module load apps/binapps/bowtie2/2.4.1
+ulimit -S -n 4096 -v unlimited
+export OMP_NUM_THREADS=$NSLOTS
+
+PREFIX=`awk "NR==$SGE_TASK_ID" strain_id.txt`
+
+SPADES="./spades/$PREFIX.unmasked.fasta"
+READ1TAR="./trimmed_reads/${PREFIX}_1.clean.fastq.tar.gz"
+READ2TAR="./trimmed_reads/${PREFIX}_2.clean.fastq.tar.gz"
+READ1=$( echo "$READ1TAR" | cut -d'/' -f3 | sed "s/.tar.gz//" )
+READ2=$( echo "$READ2TAR" | cut -d'/' -f3 | sed "s/.tar.gz//" )
+REF="CEA10_plusMT.fasta"
+
+
+# Extract reads
+STARTM=`date -u "+%s"`
+tar -xvzf $READ1TAR --strip-components=3
+tar -xvzf $READ2TAR --strip-components=3
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "EXTRACT"
+
+# Map reads to contigs (bowtie2 v2.4.1, samtools v4.8.5)
+STARTM=`date -u "+%s"`
+mkdir -p selfmap
+bowtie2-build $SPADES $PREFIX # CHANGE
+bowtie2 -p $NSLOTS --sensitive -x $PREFIX -1 $READ1 -2 $READ2 -S $PREFIX.tmp.sam
+samtools view -q10 -bS $PREFIX.tmp.sam | samtools sort -o $PREFIX.bam
+samtools index -bc $PREFIX.bam
+samtools index $PREFIX.bam
+samtools faidx $SPADES
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "SELFMAP"
+rm $READ1
+rm $READ2
+
+# Polish (pilon v1.24)
+STARTM=`date -u "+%s"`
+mkdir -p pilon
+conda activate pilon
+export _JAVA_OPTIONS="-Xmx10G -XX:CompressedClassSpaceSize=256m"
+#java -jar ~/pilon-1.24.jar --genome $SPADES --bam $PREFIX.bam --output $PREFIX
+pilon --genome $SPADES --bam $PREFIX.bam --output $PREFIX.pilon
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "POLISH"
+gzip $PREFIX.bam
+mv $PREFIX.bam* ./selfmap
+rm $PREFIX.*.bt2 $PREFIX.tmp.sam
+
+# Scaffold to CEA10 (ragtag)
+STARTM=`date -u "+%s"`
+conda activate ragtag
+mkdir -p ragtag/$PREFIX
+ragtag.py scaffold $REF $PREFIX.pilon.fasta -u -o ragtag/$PREFIX -t $NSLOTS -r
+# Tidy ragtag result
+sed "s/'//g" ragtag/$PREFIX/ragtag.scaffold.fasta | sed 's/[b,v]//g' | sed 's/_length.*//g' | sed 's/_RagTag//g' | sed 's/>/>'"$PREFIX"'_/' > $PREFIX.ragtag.fasta
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "SCAFFOLD"
+mv $PREFIX.pilon.fasta* ./pilon
+rm -r ragtag/$PREFIX
+
+# Get tRNA (tRNAscan-SE)
+STARTM=`date -u "+%s"`
+mkdir -p mito_trna/out
+mkdir -p mito_trna/ss
+mkdir -p mito_trna/fasta
+mkdir -p mito_trna/bed
+mkdir -p mito_trna/gff
+
+mkdir -p nucl_trna/out
+mkdir -p nucl_trna/ss
+mkdir -p nucl_trna/fasta
+mkdir -p nucl_trna/bed
+mkdir -p nucl_trna/gff
+conda activate tRNAscan-SE
+# Nuclear
+tRNAscan-SE -o nucl_trna/out/$PREFIX.nucl.trna.out -f nucl_trna/ss/$PREFIX.nucl.trna.ss -a nucl_trna/fasta/$PREFIX.nucl.trna.fasta -b nucl_trna/bed/$PREFIX.nucl.trna.bed -j nucl_trna/gff/$PREFIX.nucl.trna.gff --thread $NSLOTS $PREFIX.ragtag.fasta
+# Mitochondrial
+tRNAscan-SE -O -o mito_trna/out/$PREFIX.mito.trna.out -f mito_trna/ss/$PREFIX.mito.trna.ss -a mito_trna/fasta/$PREFIX.mito.trna.fasta -b mito_trna/bed/$PREFIX.mito.trna.bed -j mito_trna/gff/$PREFIX.mito.trna.gff --thread $NSLOTS $PREFIX.ragtag.fasta
+
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "TRNA"
+
+
+# Get tandem repeats
+STARTM=`date -u "+%s"`
+conda activate trf
+mkdir -p trf
+~/TRF-4.09.1/bin/trf $PREFIX.ragtag.fasta 2 7 7 80 10 50 500 -f -d -m -h 
+mv $PREFIX.ragtag.fasta.2.7.7.80.10.50.500.dat $PREFIX.trf
+trf2gff -o $PREFIX.trf.gff3 < $PREFIX.trf
+rm $PREFIX.ragtag.fasta.2.7.7.80.10.50.500.mask
+mv $PREFIX.trf* trf
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "TANDEMREP"
+
+# BUSCO
+STARTM=`date -u "+%s"`
+conda activate busco_env
+mkdir -p busco/$PREFIX
+if [ ! -e "./busco/${PREFIX}/short_summary.specific.eurotiales_odb10.$PREFIX.txt" ]
+then
+    busco -m genome -i $PREFIX.ragtag.fasta -o ./busco/${PREFIX} -l eurotiales_odb10 --offline --download_path /mnt/iusers01/pb01/f99731hc/busco_downloads -f -c $NSLOTS
+fi
+cat ./busco/${PREFIX}/short_summary.specific.eurotiales_odb10.$PREFIX.txt | grep -P 'C:.*%' | cut -d"%" -f1 | sed 's/.*C://g' > $PREFIX.stats
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "BUSCO"
+
+# General stats
+STARTM=`date -u "+%s"`
+conda activate bbtools
+mkdir -p stats
+stats.sh $PREFIX.ragtag.fasta  format=2 | grep ":" | cut -d$'\t' -f2 | sed 's/.*\///g' | sed 's/%//g' >> $PREFIX.stats
+mv $PREFIX.stats stats
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "STATS"
+
+
+
+
+# Map, extract and mask known AF293 proteins/loci (exonerate, AGAT, BEDtools)
+STARTM=`date -u "+%s"`
+# Map
+conda activate exonerate
+mkdir -p exonerate
+exonerate --model protein2genome AF293.faa $PREFIX.ragtag.fasta -n 1 --percent 90 --showtargetgff --verbose 0 --showalignment yes --showvulgar no --fsmmemory 30000 > $PREFIX.AF293.exonerate
+grep -v "#" $PREFIX.AF293.exonerate | grep -v "exonerate" > $PREFIX.AF293.exonerate.aln
+grep "exonerate" $PREFIX.AF293.exonerate | grep -P '\tgene\t' > $PREFIX.AF293.exonerate.locus.gff
+# Extract - TBC 
+#/opt/apps/apps/binapps/anaconda3/2021.11/bin/python3 exonerate2aa.py $PREFIX.AF293.exonerate.aln $PREFIX.AF293.exonerate.faa
+# Mask
+conda activate bedtools_env
+bedtools maskfasta -fi $PREFIX.ragtag.fasta -bed $PREFIX.AF293.exonerate.locus.gff -fo $PREFIX.AF293_mask.fasta
+mv $PREFIX.AF293.exonerate* exonerate
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "AF293"
+
+
+# Annotate (BRAKER2)
+STARTM=`date -u "+%s"`
+mkdir -p braker2/$PREFIX
+FILE=./braker2/$PREFIX/braker.log
+if [[ -f "$FILE" ]]; then
+    echo "$FILE exists."
+    if grep -q "BRAKER RUN FINISHED" "$FILE" 
+    then
+    echo "Braker complete."
+else
+    echo "Incomplete. Re-running braker..."
+    rm -r ./braker2/$PREFIX/*
+rm -r ~/.augustus/species/$PREFIX.braker2
+fi
+else
+echo "File missing. Running braker..."
+rm -r ~/.augustus/species/$PREFIX.braker2
+singularity exec ~/braker3.sif braker.pl --genome=$PREFIX.AF293_mask.fasta --prot_seq=odb11v0_all.fasta --workingdir=braker2/$PREFIX/ --fungus --gm_max_intergenic 10000 --threads $NSLOTS --species $PREFIX.braker2
+fi
+STOPM=`date -u "+%s"`
+RUNTIMEM=`expr $STOPM - $STARTM`
+echo -E "RUNTIME" "$RUNTIMEM" "ANNOTATE"
+
+
+
+

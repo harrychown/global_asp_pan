@@ -1,0 +1,105 @@
+#!/bin/bash --login
+#$ -cwd
+#$ -t 1-10
+#$ -pe smp.pe 4
+#$ -N zreadstat
+
+module load apps/binapps/anaconda3/2021.11
+module load tools/env/proxy2 
+module load apps/bioinf
+module load apps/binapps/gatk/4.1.8.0
+module load apps/samtools/1.4/gcc-4.8.5
+module load apps/gcc/R/4.1.2 
+
+PREFIX=`awk "NR==$SGE_TASK_ID" read-stat-missing.txt`
+
+
+### PANGENOME GENERATION PIPELINE FOR HPC ###
+export OMP_NUM_THREADS=$NSLOTS
+
+tar -xvzf trimmed_reads/${PREFIX}_1.clean.fastq.tar.gz
+tar -xvzf trimmed_reads/${PREFIX}_2.clean.fastq.tar.gz
+
+### CHECK CONTAMINATION ###
+# Kraken2
+if [ ! -e "./kraken/${PREFIX}/${PREFIX}_all_out.tsv" ]
+then
+	DBNAME=/mnt/iusers01/pb01/f99731hc/scratch/fungal_kraken
+	mkdir -p kraken/$PREFIX
+	conda activate kraken2
+	kraken2 --output "./kraken/${PREFIX}/${PREFIX}_all_out.tsv" --report "./kraken/${PREFIX}/${PREFIX}_all_report.tsv" --db $DBNAME --threads $NSLOTS --paired "./trimmed_reads/${PREFIX}/${PREFIX}_1.clean.fastq" "./trimmed_reads/${PREFIX}/${PREFIX}_2.clean.fastq"  --unclassified-out ./kraken/${PREFIX}/${PREFIX}_unclassified#.fastq
+fi
+
+
+### ALIGN TO REF ###
+# Function to align reference
+alignREF() {
+	mkdir -p "${REF_PREFIX}_mapping/${PREFIX}"
+	OUTFOLDER="./${REF_PREFIX}_mapping/${PREFIX}"
+	conda activate persist_env
+	export OMP_NUM_THREADS=$NSLOTS
+	module load apps/picard/2.1.0/bin
+	# Check if dictionary needs to be generated
+	DICT_PREFIX=$(echo $REF | sed 's![^\.]*$!!')
+  	if [ ! -e "${DICT_PREFIX}dict" ]
+	then
+		picard CreateSequenceDictionary R=$REF O="${DICT_PREFIX}dict"
+	fi
+	# Check if FASTA index needs to be generated
+  	if [ ! -e $REF.fai ]
+	then
+		samtools faidx $REF
+	fi
+
+	if [ ! -e $REF.pac ]
+	then
+		bwa index $REF
+	fi
+	if [ ! -e "${OUTFOLDER}/$PREFIX.$REF_PREFIX.sam" ] || [ $(stat --printf="%s" "${OUTFOLDER}/$PREFIX.$REF_PREFIX.sam" ) -lt 30720 ]
+	then
+		bwa mem -t $NSLOTS $REF "./trimmed_reads/${PREFIX}/${PREFIX}_1.clean.fastq" "./trimmed_reads/${PREFIX}/${PREFIX}_2.clean.fastq" > ${OUTFOLDER}/$PREFIX.$REF_PREFIX.sam
+	fi
+	# Format alignments
+	if [ ! -e "${OUTFOLDER}/$PREFIX.$REF_PREFIX.sorted.bam" ] || [ $(stat --printf="%s" "${OUTFOLDER}/$PREFIX.$REF_PREFIX.sorted.bam" ) -lt 30720 ]
+	then
+		# Convert SAM to BAM
+		samtools view -@ $NSLOTS -S -b ${OUTFOLDER}/$PREFIX.$REF_PREFIX.sam > ${OUTFOLDER}/$PREFIX.$REF_PREFIX.bam
+		# Sort BAM file
+		samtools sort -@ $NSLOTS ${OUTFOLDER}/$PREFIX.$REF_PREFIX.bam -o ${OUTFOLDER}/$PREFIX.$REF_PREFIX.sorted.bam
+	
+	fi
+
+	### ALIGNMENT QC ###
+
+  	# QualiMap - GC content and coverage
+  	module load apps/gcc/R/4.1.2 
+  	mkdir -p $OUTFOLDER/qualimap_$REF_PREFIX
+  	/mnt/iusers01/pb01/f99731hc/qualimap_v2.2.1/qualimap bamqc -nt $NSLOTS -bam ./$OUTFOLDER/$PREFIX.$REF_PREFIX.sorted.bam -outdir ./$OUTFOLDER/qualimap_$REF_PREFIX
+
+
+}
+
+# Align against af293
+REF="/mnt/iusers01/pb01/f99731hc/GCF_000002655.1_ASM265v1_genomic.fna"
+REF_PREFIX=af293
+alignREF
+
+### ASSEMBLY QC ###
+mkdir -p assembly_stats/${PREFIX}
+mkdir -p busco/${PREFIX}
+# Qualimap - avg. coverage
+echo $PREFIX > ./assembly_stats/${PREFIX}/$PREFIX.stats
+grep "mean coverageData" "./${REF_PREFIX}_mapping/${PREFIX}/qualimap_$REF_PREFIX/genome_results.txt" | cut -d"=" -f2 | sed 's/ //g' | sed 's/X//g' >> ./assembly_stats/${PREFIX}/$PREFIX.stats
+# BUSCO completeness
+conda activate busco_env
+export OMP_NUM_THREADS=$NSLOTS
+if [ ! -e "./busco/${PREFIX}/short_summary.specific.eurotiales_odb10.$PREFIX.txt" ]
+then
+	cp ragtag/$PREFIX.ragtag.fasta.gz .
+	gunzip $PREFIX.ragtag.fasta.gz .
+	busco -m genome -i "$PREFIX.ragtag.fasta" -o ./busco/${PREFIX} -l eurotiales_odb10 --offline --download_path /mnt/iusers01/pb01/f99731hc/busco_downloads -f -c $NSLOTS
+fi
+cat ./busco/${PREFIX}/short_summary.specific.eurotiales_odb10.$PREFIX.txt | grep -P 'C:.*%' | cut -d"%" -f1 | sed 's/.*C://g' >> ./assembly_stats/${PREFIX}/$PREFIX.stats
+# Kraken Afum
+grep -Fw "746128" "./kraken/$PREFIX/${PREFIX}_all_report.tsv" | awk '{ print $1 }' >> ./assembly_stats/${PREFIX}/$PREFIX.stats
+

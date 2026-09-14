@@ -1,0 +1,22 @@
+#!/bin/bash
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=1:mem=6gb
+#PBS -N zrep
+#PBS -J 1-4
+
+OG_DIR="/rds/general/user/hchown/home/orthofinder/OrthoFinder/Results_Jan19/WorkingDirectory/OrthoFinder/Results_Jan22_1/Orthogroup_Sequences"
+OG_FILE=$(sed -n "${PBS_ARRAY_INDEX}p" /rds/general/user/hchown/home/global/pangenome/orthogroup-sequences.txt)
+DATA_DIR="/rds/general/user/hchown/home/global/data"
+
+
+module load anaconda3/personal
+
+source activate samtools
+cp $OG_DIR/$OG_FILE .
+samtools faidx $OG_FILE 
+
+PREFIX=$( echo "$OG_FILE" | cut -d'.' -f1 )
+ID=$( sort -k2,2 -h $OG_FILE.fai | tail -n1 | awk '{ print $1 }' )
+echo "${PREFIX},${ID}" > $DATA_DIR/rep-pangenome-key/$PREFIX.key
+grep -A1 "$ID" $OG_FILE | sed 's/>.*/>'"$PREFIX"'/g'> $DATA_DIR/representative-pangenome/$PREFIX.fasta
+
